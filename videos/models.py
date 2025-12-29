@@ -3,6 +3,7 @@ from django.conf import settings
 from courses.models import Course
 import os
 import json
+from django.utils import timezone
 
 
 class InteractiveCourse(models.Model):
@@ -76,7 +77,12 @@ class InteractiveCourseProgress(models.Model):
     
     # Slide completion tracking (JSON: {"1": true, "2": true, "3": false, ...})
     slides_completed = models.JSONField(default=dict, blank=True, help_text='Track which slides are completed')
-    
+
+    # Per-slide timestamps for anti-skip enforcement
+    slide_started_at = models.JSONField(default=dict, blank=True, help_text='ISO timestamps keyed by slide number for when user started a slide')
+    slide_completed_at = models.JSONField(default=dict, blank=True, help_text='ISO timestamps keyed by slide number for when user completed a slide')
+    skip_attempts = models.IntegerField(default=0, help_text='Count invalid slide jump attempts')
+
     # Quiz/assessment scores from the interactive course
     quiz_score = models.FloatField(null=True, blank=True)
     quiz_passed = models.BooleanField(null=True)
@@ -116,11 +122,44 @@ class InteractiveCourseProgress(models.Model):
     
     def can_access_slide(self, slide_number):
         """Check if user can access a specific slide (no skipping)"""
-        return slide_number <= self.highest_slide_reached + 1
-    
+        try:
+            slide_number = int(slide_number)
+        except (TypeError, ValueError):
+            return False
+
+        if slide_number < 1:
+            return False
+
+        total_slides = int(self.interactive_course.total_slides or 0)
+        if total_slides > 0 and slide_number > total_slides:
+            return False
+
+        return slide_number <= int(self.highest_slide_reached or 0) + 1
+
+    def get_min_time_per_slide_seconds(self):
+        total_slides = int(self.interactive_course.total_slides or 0)
+        if total_slides <= 0:
+            return 20
+        duration_minutes = int(self.interactive_course.duration_minutes or 0)
+        return max(20, (duration_minutes * 60) // total_slides) if duration_minutes > 0 else 20
+
+    def start_slide(self, slide_number):
+        """Persist a slide start timestamp (idempotent)."""
+        slide_number = int(slide_number)
+        key = str(slide_number)
+        if not self.slide_started_at.get(key):
+            self.slide_started_at[key] = timezone.now().isoformat()
+
     def mark_slide_completed(self, slide_number):
         """Mark a slide as completed and update progress"""
-        self.slides_completed[str(slide_number)] = True
+        slide_number = int(slide_number)
+        key = str(slide_number)
+
+        self.slides_completed[key] = True
+        self.start_slide(slide_number)
+        if not self.slide_completed_at.get(key):
+            self.slide_completed_at[key] = timezone.now().isoformat()
+
         if slide_number > self.highest_slide_reached:
             self.highest_slide_reached = slide_number
         self.current_slide = slide_number

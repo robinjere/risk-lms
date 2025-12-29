@@ -22,6 +22,11 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from datetime import datetime
+import logging
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+logger = logging.getLogger(__name__)
 
 # Try to import moviepy, fallback to basic duration if not available
 try:
@@ -852,6 +857,11 @@ def play_interactive_course(request, course_id, interactive_id):
         user=request.user,
         interactive_course=interactive_course
     )
+
+    # Resume safety: never resume beyond the highest legitimately reached slide.
+    if progress.highest_slide_reached and progress.current_slide > progress.highest_slide_reached:
+        progress.current_slide = progress.highest_slide_reached
+        progress.save(update_fields=['current_slide', 'updated_at'])
     
     # Calculate progress dash offset for circular SVG (circumference is 339.292)
     circumference = 339.292
@@ -878,7 +888,17 @@ def update_interactive_progress(request, interactive_id):
     interactive_course = get_object_or_404(InteractiveCourse, id=interactive_id)
     
     try:
-        data = json.loads(request.body)
+        try:
+            data = json.loads(request.body or "{}")
+        except json.JSONDecodeError:
+            return JsonResponse(
+                {
+                    'success': False,
+                    'error': 'Invalid JSON payload.',
+                    'code': 'invalid_json',
+                },
+                status=400,
+            )
         
         progress, created = InteractiveCourseProgress.objects.get_or_create(
             user=request.user,
@@ -886,34 +906,133 @@ def update_interactive_progress(request, interactive_id):
         )
         
         total_slides = interactive_course.total_slides
-        
-        # Track highest slide reached - accept any value higher than current
-        if 'highest_slide_reached' in data:
-            new_highest = int(data['highest_slide_reached'])
-            # Only update if new value is higher (allow catch-up for missed saves)
-            if new_highest > progress.highest_slide_reached:
-                progress.highest_slide_reached = min(new_highest, total_slides + 5)  # Cap at total + buffer
-                # Auto-mark slides as completed
-                for i in range(1, progress.highest_slide_reached + 1):
-                    progress.slides_completed[str(i)] = True
-        
-        # Track current slide - be lenient to allow navigation
-        if 'current_slide' in data:
-            slide_num = int(data['current_slide'])
-            progress.current_slide = slide_num
-            # Update highest if current is higher
-            if slide_num > progress.highest_slide_reached:
-                progress.highest_slide_reached = slide_num
-                # Auto-mark slides as completed
-                for i in range(1, slide_num + 1):
-                    progress.slides_completed[str(i)] = True
-        
-        # Mark specific slide as completed
+        min_time_per_slide_seconds = progress.get_min_time_per_slide_seconds()
+        now = timezone.now()
+
+        def _parse_int(value, field_name):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                raise ValueError(f'Invalid {field_name}. Must be an integer.')
+
+        def _parse_ts(value):
+            if not value:
+                return None
+            dt = parse_datetime(str(value))
+            if not dt:
+                return None
+            if timezone.is_naive(dt):
+                dt = timezone.make_aware(dt, timezone.get_current_timezone())
+            return dt
+
+        def _reject(message, *, status=400, code='invalid_request'):
+            return JsonResponse(
+                {
+                    'success': False,
+                    'error': message,
+                    'code': code,
+                    'current_slide': progress.current_slide,
+                    'highest_slide_reached': progress.highest_slide_reached,
+                    'allowed_next_slide': (progress.highest_slide_reached or 0) + 1,
+                    'total_slides': total_slides,
+                },
+                status=status,
+            )
+
+        try:
+            # Reject obvious slide-jump attempts early (even if client sends highest_slide_reached).
+            if 'highest_slide_reached' in data:
+                requested_highest = _parse_int(data.get('highest_slide_reached'), 'highest_slide_reached')
+                if requested_highest > (progress.highest_slide_reached or 0) + 1:
+                    progress.skip_attempts = (progress.skip_attempts or 0) + 1
+                    progress.save(update_fields=['skip_attempts', 'updated_at'])
+                    logger.warning(
+                        'Interactive skip attempt: user=%s course=%s requested_highest=%s current=%s highest=%s',
+                        request.user.id,
+                        interactive_course.id,
+                        requested_highest,
+                        progress.current_slide,
+                        progress.highest_slide_reached,
+                    )
+                    return _reject(
+                        'Cannot unlock future slides. Complete the previous slide to continue.',
+                        status=403,
+                        code='slide_skip',
+                    )
+
+            requested_current_slide = None
+            if 'current_slide' in data:
+                requested_current_slide = _parse_int(data.get('current_slide'), 'current_slide')
+        except ValueError as ve:
+            return _reject(str(ve), status=400, code='invalid_payload')
+
+        # Slide completion must be explicit (Next button). Enforce sequential completion + minimum time.
+        slide_completed = None
         if 'slide_completed' in data:
-            slide_num = int(data['slide_completed'])
-            progress.mark_slide_completed(slide_num)
-            if slide_num > progress.highest_slide_reached:
-                progress.highest_slide_reached = slide_num
+            try:
+                slide_completed = _parse_int(data.get('slide_completed'), 'slide_completed')
+            except ValueError as ve:
+                return _reject(str(ve), status=400, code='invalid_payload')
+            if slide_completed < 1 or (total_slides and slide_completed > total_slides):
+                return _reject('Invalid slide number.', status=400, code='invalid_slide')
+
+            if slide_completed > (progress.highest_slide_reached or 0) + 1:
+                progress.skip_attempts = (progress.skip_attempts or 0) + 1
+                progress.save(update_fields=['skip_attempts', 'updated_at'])
+                logger.warning(
+                    'Interactive skip attempt (complete): user=%s course=%s slide_completed=%s current=%s highest=%s',
+                    request.user.id,
+                    interactive_course.id,
+                    slide_completed,
+                    progress.current_slide,
+                    progress.highest_slide_reached,
+                )
+                return _reject(
+                    f'Cannot complete slide {slide_completed} yet. Complete previous slides first.',
+                    status=403,
+                    code='slide_skip',
+                )
+
+            # Ensure we have a recorded start time for this slide.
+            progress.start_slide(slide_completed)
+            started_at = _parse_ts(progress.slide_started_at.get(str(slide_completed)))
+            if not started_at:
+                started_at = now
+                progress.slide_started_at[str(slide_completed)] = started_at.isoformat()
+
+            elapsed = (now - started_at).total_seconds()
+            if elapsed < min_time_per_slide_seconds:
+                remaining = int(max(1, min_time_per_slide_seconds - elapsed))
+                progress.save(update_fields=['slide_started_at', 'updated_at'])
+                return _reject(
+                    f'Slide unlocks in {remaining}s. Please finish the slide before continuing.',
+                    status=400,
+                    code='min_time_not_met',
+                )
+
+            progress.mark_slide_completed(slide_completed)
+
+        # Track current slide (allowed only for current/previous/next-unlocked slide).
+        if requested_current_slide and requested_current_slide > 0:
+            if not progress.can_access_slide(requested_current_slide):
+                progress.skip_attempts = (progress.skip_attempts or 0) + 1
+                progress.save(update_fields=['skip_attempts', 'updated_at'])
+                logger.warning(
+                    'Interactive skip attempt: user=%s course=%s requested_current=%s current=%s highest=%s',
+                    request.user.id,
+                    interactive_course.id,
+                    requested_current_slide,
+                    progress.current_slide,
+                    progress.highest_slide_reached,
+                )
+                return _reject(
+                    f'Slide {requested_current_slide} is locked. Complete previous slides to unlock.',
+                    status=403,
+                    code='slide_locked',
+                )
+
+            progress.current_slide = requested_current_slide
+            progress.start_slide(requested_current_slide)
         
         # Track time spent (in minutes)
         if 'time_spent' in data:
@@ -975,7 +1094,8 @@ def update_interactive_progress(request, interactive_id):
         })
         
     except Exception as e:
-        return JsonResponse({'error': str(e)}, status=500)
+        logger.exception('Failed to update interactive progress: user=%s course=%s', request.user.id, interactive_course.id)
+        return JsonResponse({'success': False, 'error': str(e)}, status=500)
 
 
 @login_required

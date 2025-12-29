@@ -314,7 +314,7 @@
                             </div>
                             <div>
                                 <button id="nextSlideBtn" class="btn btn-success" onclick="advanceToNextSlide()" disabled>
-                                    <i class="fas fa-arrow-right mr-2"></i> Next Slide
+                                    <i class="fas fa-arrow-right mr-2"></i> <span id="nextSlideLabel">Next Slide</span>
                                     <span id="nextSlideLock" class="ml-2 badge badge-light">
                                         <i class="fas fa-lock"></i> <span id="unlockCountdown">--</span>s
                                     </span>
@@ -553,6 +553,9 @@ let timeTracker = null;
 let slideTimer = null;
 let slideTimeRemaining = 0;
 let canAdvance = false;
+let pendingCaptivateTargetSlide = null;
+let pendingAdvanceInFlight = false;
+let lastKnownCaptivateSlide = 0;
 
 // Start the course - show iframe and begin tracking
 function startCourse() {
@@ -563,15 +566,8 @@ function startCourse() {
     document.getElementById('launchSection').style.display = 'none';
     document.getElementById('coursePlayerSection').style.display = 'block';
     
-    // Resume from last position or start at slide 1
-    if (highestSlideReached === 0) {
-        currentSlide = 1;
-        highestSlideReached = 1;
-    } else {
-        // Resume - set current slide to the next one after highest completed
-        // Or stay at highest if not all completed
-        currentSlide = highestSlideReached;
-    }
+    // Resume from last completed slide (never beyond highestSlideReached)
+    currentSlide = Math.max(1, Math.min(totalSlides, highestSlideReached || 1));
     
     // Load the Captivate course
     const iframe = document.getElementById('courseIframe');
@@ -580,6 +576,7 @@ function startCourse() {
     // Inject SCORM API and navigate to resume slide when iframe loads
     iframe.onload = function() {
         injectScormApiToIframe(iframe);
+        setupCaptivateNavigationGuard(iframe);
         
         // If resuming, navigate Captivate to the saved slide after a short delay
         // (Captivate needs time to initialize)
@@ -600,9 +597,12 @@ function startCourse() {
     // Update UI
     updateProgressUI();
     updateSlideDisplay(currentSlide);
+
+    // Persist slide start (server enforces min time from first start)
+    saveProgress({ current_slide: currentSlide });
     
     // Show appropriate message
-    if (highestSlideReached > 1) {
+    if (highestSlideReached > 0) {
         showToast('📚 Resuming Course', 
             `You've completed ${highestSlideReached} of ${totalSlides} slides. The course will jump to slide ${currentSlide}.`, 
             'info');
@@ -622,6 +622,8 @@ function startSlideTimer() {
     const nextBtn = document.getElementById('nextSlideBtn');
     const lockBadge = document.getElementById('nextSlideLock');
     const statusText = document.getElementById('slideStatusText');
+
+    setNextButtonLabel();
     
     // Check if this slide was already completed (currentSlide <= highestSlideReached means it's done)
     if (currentSlide <= highestSlideReached && currentSlide < totalSlides) {
@@ -653,9 +655,9 @@ function startSlideTimer() {
         canAdvance = false;
         nextBtn.disabled = true;
         lockBadge.style.display = 'none';
-        statusText.innerHTML = '<i class="fas fa-flag-checkered text-success"></i> Final slide! Watch to complete the course.';
+        statusText.innerHTML = '<i class="fas fa-flag-checkered text-success"></i> Final slide! Watch to unlock <strong>Finish</strong>.';
         
-        // Mark as complete after timer
+        // Unlock after timer (completion requires explicit click)
         slideTimeRemaining = minTimePerSlide;
         document.getElementById('slideTimerBadge').style.display = 'inline';
         document.getElementById('slideTimeRemaining').textContent = slideTimeRemaining;
@@ -667,10 +669,11 @@ function startSlideTimer() {
             if (slideTimeRemaining <= 0) {
                 clearInterval(slideTimer);
                 document.getElementById('slideTimerBadge').style.display = 'none';
-                markCurrentSlideComplete();
-                statusText.innerHTML = '<i class="fas fa-trophy text-warning"></i> Course content completed! Take the quiz to earn your certificate.';
-                showToast('🎉 Content Complete!', 'All slides finished! Take the quiz to earn your certificate.', 'success');
-                showCompletionModal();
+                slideTimer = null;
+                canAdvance = true;
+                nextBtn.disabled = false;
+                statusText.innerHTML = '<i class="fas fa-unlock text-success"></i> Final slide unlocked! Click <strong>Finish</strong> to save completion.';
+                showToast('✓ Final Slide Unlocked', 'Click "Finish" to complete the content.', 'success');
             }
         }, 1000);
         return;
@@ -699,13 +702,13 @@ function startSlideTimer() {
             
             document.getElementById('slideTimerBadge').style.display = 'none';
             
-            // Unlock the next button
+            // Unlock the button (completion still requires explicit click + backend save)
             canAdvance = true;
             nextBtn.disabled = false;
             lockBadge.style.display = 'none';
-            statusText.innerHTML = '<i class="fas fa-unlock text-success"></i> Slide ' + currentSlide + ' complete! Click <strong>Next Slide</strong> to continue.';
+            statusText.innerHTML = '<i class="fas fa-unlock text-success"></i> Slide unlocked! Click <strong>Next Slide</strong> to continue.';
             
-            showToast('✓ Slide ' + currentSlide + ' Complete', 'Click "Next Slide" to continue to slide ' + (currentSlide + 1), 'success');
+            showToast('✓ Slide Unlocked', 'Click "Next Slide" to continue.', 'success');
         } else {
             statusText.innerHTML = '<i class="fas fa-hourglass-half text-warning"></i> Watch the content. Next slide unlocks in <strong>' + slideTimeRemaining + '</strong> seconds...';
         }
@@ -714,47 +717,76 @@ function startSlideTimer() {
 
 // Advance to next slide
 function advanceToNextSlide() {
+    if (pendingAdvanceInFlight) return;
+
     // Check if we can advance
     if (!canAdvance) {
-        showToast('⏳ Please Wait', 'Watch the current slide content first.', 'warning');
+        showToast('⏳ Please Wait', 'Slide is still locked. Finish the countdown to unlock.', 'warning');
         return;
     }
     
-    // Check if we're already at the last slide
+    const isCurrentSlideCompleted = currentSlide <= highestSlideReached;
+
+    // Incomplete slide: require explicit completion + server confirmation.
+    if (!isCurrentSlideCompleted) {
+        pendingAdvanceInFlight = true;
+        const nextSlide = Math.min(totalSlides, currentSlide + 1);
+        pendingCaptivateTargetSlide = nextSlide;
+
+        saveProgress({
+            slide_completed: currentSlide,
+            current_slide: nextSlide
+        })
+        .then(({ ok, data }) => {
+            pendingAdvanceInFlight = false;
+            if (!ok || !data.success) {
+                handleProgressError(data);
+                pendingCaptivateTargetSlide = null;
+                return;
+            }
+
+            syncFromServer(data);
+
+            if (currentSlide >= totalSlides && contentCompleted) {
+                showToast('🎉 Content Complete!', 'All slides finished! Take the quiz to earn your certificate.', 'success');
+                showCompletionModal();
+                pendingCaptivateTargetSlide = null;
+                return;
+            }
+
+            triggerCaptivateNextSlide();
+            startSlideTimer();
+        })
+        .catch(err => {
+            pendingAdvanceInFlight = false;
+            pendingCaptivateTargetSlide = null;
+            console.error('[LMS] Advance failed:', err);
+            showToast('⚠️ Save Failed', 'Could not save progress. Please try again.', 'error');
+        });
+
+        return;
+    }
+
+    // Completed slide: allow navigation within unlocked range.
     if (currentSlide >= totalSlides) {
         showToast('Course Complete', 'You have completed all slides! Take the quiz now.', 'success');
         return;
     }
-    
-    // Move to next slide
-    currentSlide++;
-    
-    // Update highest reached if this is a new slide
-    if (currentSlide > highestSlideReached) {
-        highestSlideReached = currentSlide;
+
+    const nextSlide = currentSlide + 1;
+    if (nextSlide > highestSlideReached + 1) {
+        showToast('🔒 Slide Locked', 'Complete previous slides to unlock.', 'warning');
+        return;
     }
-    
-    // Calculate completion percentage based on highest slide reached
-    // We count a slide as complete when user advances past it
-    const completedSlides = Math.max(0, highestSlideReached - 1);
-    completionPercentage = Math.min(100, Math.round((completedSlides / totalSlides) * 100));
-    
-    // If we're on the last slide, mark previous slides as complete
-    if (currentSlide >= totalSlides) {
-        completionPercentage = Math.round(((totalSlides - 1) / totalSlides) * 100);
-    }
-    
-    // **TRIGGER NEXT SLIDE IN CAPTIVATE COURSE**
-    triggerCaptivateNextSlide();
-    
-    // Update UI
+
+    currentSlide = nextSlide;
     updateProgressUI();
     updateSlideDisplay(currentSlide);
-    
-    // Save progress
-    saveProgress();
-    
-    // Start timer for new slide
+    setNextButtonLabel();
+    saveProgress({ current_slide: currentSlide });
+
+    pendingCaptivateTargetSlide = currentSlide;
+    triggerCaptivateNextSlide();
     startSlideTimer();
 }
 
@@ -788,8 +820,9 @@ function triggerCaptivateNextSlide() {
         
         // Method 3: Try cpCmndGotoSlide to go to specific slide
         if (typeof iframeWindow.cpCmndGotoSlide !== 'undefined') {
-            iframeWindow.cpCmndGotoSlide = currentSlide;
-            console.log('[LMS] Triggered cpCmndGotoSlide =', currentSlide);
+            iframeWindow.cpCmndGotoSlide = Math.max(0, currentSlide - 1);
+            setTimeout(() => { try { iframeWindow.cpCmndGotoSlide = currentSlide; } catch (e) {} }, 200);
+            console.log('[LMS] Triggered cpCmndGotoSlide for slide', currentSlide);
             return;
         }
         
@@ -837,6 +870,80 @@ function triggerCaptivateNextSlide() {
 }
 
 /**
+ * Best-effort guard against Captivate navigation APIs.
+ * (Still backed by backend validation + polling enforcement.)
+ */
+function setupCaptivateNavigationGuard(iframe) {
+    try {
+        const w = iframe.contentWindow;
+        if (!w) return;
+
+        // Try to mitigate in-iframe back/forward (same-origin only).
+        try {
+            w.history && w.history.pushState && w.history.pushState(null, w.document.title, w.location.href);
+            w.addEventListener && w.addEventListener('popstate', function() {
+                try { w.history.pushState(null, w.document.title, w.location.href); } catch (e) {}
+            });
+        } catch (e) {}
+
+        const api = w.cpAPIInterface;
+        if (!api || api.__lmsNavGuardInstalled) return;
+        api.__lmsNavGuardInstalled = true;
+
+        const originalNext = (typeof api.next === 'function') ? api.next.bind(api) : null;
+        const originalPrev = (typeof api.previous === 'function') ? api.previous.bind(api) : null;
+        const originalGoto = (typeof api.gotoSlide === 'function') ? api.gotoSlide.bind(api) : null;
+
+        function isAllowedTargetSlide(targetSlideOneBased) {
+            if (targetSlideOneBased < 1 || targetSlideOneBased > totalSlides) return false;
+            if (targetSlideOneBased === currentSlide) return true;
+            if (targetSlideOneBased <= highestSlideReached) return true; // completed slides
+            if (targetSlideOneBased === highestSlideReached + 1) {
+                return !!(pendingCaptivateTargetSlide && targetSlideOneBased === pendingCaptivateTargetSlide);
+            }
+            return false;
+        }
+
+        api.next = function() {
+            const captivateCurrent = (typeof w.cpInfoCurrentSlide !== 'undefined')
+                ? (parseInt(w.cpInfoCurrentSlide, 10) + 1)
+                : (currentSlide || 1);
+            const target = captivateCurrent + 1;
+            if (!canAdvance || !isAllowedTargetSlide(target)) {
+                showToast('🔒 Navigation Blocked', 'Use the "Next Slide" button to continue.', 'warning');
+                goToCaptivateSlide(currentSlide || 1);
+                return false;
+            }
+            return originalNext ? originalNext() : true;
+        };
+
+        api.previous = function() {
+            const captivateCurrent = (typeof w.cpInfoCurrentSlide !== 'undefined')
+                ? (parseInt(w.cpInfoCurrentSlide, 10) + 1)
+                : (currentSlide || 1);
+            const target = Math.max(1, captivateCurrent - 1);
+            if (!isAllowedTargetSlide(target)) {
+                goToCaptivateSlide(currentSlide || 1);
+                return false;
+            }
+            return originalPrev ? originalPrev() : true;
+        };
+
+        api.gotoSlide = function(index) {
+            const target = parseInt(index, 10) + 1; // Captivate commonly uses 0-based slide index here
+            if (!isAllowedTargetSlide(target)) {
+                showToast('🔒 Slide Locked', 'Complete previous slides to unlock.', 'warning');
+                goToCaptivateSlide(currentSlide || 1);
+                return false;
+            }
+            return originalGoto ? originalGoto(index) : true;
+        };
+    } catch (e) {
+        // Best-effort only; polling + backend enforcement still apply.
+    }
+}
+
+/**
  * Go to a specific slide in Captivate
  */
 function goToCaptivateSlide(slideNumber) {
@@ -846,19 +953,20 @@ function goToCaptivateSlide(slideNumber) {
     try {
         const iframeWindow = iframe.contentWindow;
         
-        // Captivate uses 0-based indexing internally
-        const captivateSlideIndex = slideNumber - 1;
+        // Captivate often uses 0-based indexing internally, but this varies by build.
+        const captivateSlideIndex0 = Math.max(0, slideNumber - 1);
         
-        // Try cpCmndGotoSlide
+        // Try cpCmndGotoSlide (0-index first, then 1-index fallback)
         if (typeof iframeWindow.cpCmndGotoSlide !== 'undefined') {
-            iframeWindow.cpCmndGotoSlide = captivateSlideIndex;
-            console.log('[LMS] Going to slide', slideNumber, '(index:', captivateSlideIndex, ')');
+            iframeWindow.cpCmndGotoSlide = captivateSlideIndex0;
+            setTimeout(() => { try { iframeWindow.cpCmndGotoSlide = slideNumber; } catch (e) {} }, 200);
+            console.log('[LMS] Going to slide', slideNumber);
             return;
         }
         
         // Try cpAPIInterface
         if (iframeWindow.cpAPIInterface && typeof iframeWindow.cpAPIInterface.gotoSlide === 'function') {
-            iframeWindow.cpAPIInterface.gotoSlide(captivateSlideIndex);
+            iframeWindow.cpAPIInterface.gotoSlide(captivateSlideIndex0);
             return;
         }
         
@@ -867,19 +975,15 @@ function goToCaptivateSlide(slideNumber) {
     }
 }
 
-// Mark current slide as complete
-function markCurrentSlideComplete() {
-    if (currentSlide > highestSlideReached) {
-        highestSlideReached = currentSlide;
-    }
-    completionPercentage = Math.min(100, Math.round((highestSlideReached / totalSlides) * 100));
-    
-    // Check if all slides completed
-    if (highestSlideReached >= totalSlides && !contentCompleted) {
-        contentCompleted = true;
-    }
-    
-    saveProgress();
+function setNextButtonLabel() {
+    const btn = document.getElementById('nextSlideBtn');
+    if (!btn) return;
+
+    const icon = btn.querySelector('i');
+    const labelEl = document.getElementById('nextSlideLabel');
+    const label = (currentSlide >= totalSlides) ? 'Finish' : 'Next Slide';
+    if (icon) icon.className = (currentSlide >= totalSlides) ? 'fas fa-flag-checkered mr-2' : 'fas fa-arrow-right mr-2';
+    if (labelEl) labelEl.textContent = label;
 }
 
 // Inject SCORM API into the iframe's content window
@@ -1051,37 +1155,52 @@ function parseSlideNumber(location) {
 // Called when SCORM reports a slide change (auto-advance)
 function onScormSlideChange(slideNum) {
     console.log('[LMS] SCORM slide change detected:', slideNum);
-    
-    // If SCORM reports we moved to a new slide, auto-advance
-    if (slideNum > currentSlide) {
-        // Mark current slide complete
-        if (currentSlide >= highestSlideReached) {
-            highestSlideReached = currentSlide;
-        }
-        
-        // Update to new slide
+    if (slideNum < 1 || slideNum > totalSlides) return;
+
+    // Block future slide access.
+    if (slideNum > highestSlideReached + 1) {
+        console.warn('[LMS] Captivate tried to skip ahead to slide', slideNum);
+        goToCaptivateSlide(currentSlide || (highestSlideReached + 1));
+        showToast('🔒 Slide Locked', 'Complete previous slides to unlock.', 'warning');
+        return;
+    }
+
+    if (slideNum === currentSlide) return;
+
+    // Allow revisiting already-completed slides (forward/back).
+    if (slideNum <= highestSlideReached) {
         currentSlide = slideNum;
-        if (slideNum > highestSlideReached) {
-            highestSlideReached = slideNum;
-        }
-        
-        completionPercentage = Math.min(100, Math.round((highestSlideReached / totalSlides) * 100));
-        
         updateProgressUI();
         updateSlideDisplay(slideNum);
-        saveProgress();
-        
-        // Restart timer for new slide
+        setNextButtonLabel();
+        saveProgress({ current_slide: currentSlide });
         startSlideTimer();
-        
-        // Check completion
-        if (highestSlideReached >= totalSlides && !contentCompleted) {
-            contentCompleted = true;
-            setTimeout(() => {
-                showToast('🎉 All Slides Completed!', 'Take the quiz to earn your certificate.', 'success');
-                showCompletionModal();
-            }, 1000);
+        return;
+    }
+
+    // Only allow entering the next unlocked (incomplete) slide when initiated by the LMS button.
+    if (slideNum === highestSlideReached + 1) {
+        if (!pendingCaptivateTargetSlide || slideNum !== pendingCaptivateTargetSlide) {
+            goToCaptivateSlide(currentSlide);
+            showToast('🔒 Navigation Blocked', 'Use the "Next Slide" button to continue.', 'warning');
+            return;
         }
+
+        // If we are still in countdown, don't allow Captivate to advance.
+        if (!canAdvance && slideNum > currentSlide) {
+            console.warn('[LMS] Captivate tried to advance during countdown');
+            goToCaptivateSlide(currentSlide);
+            showToast('⏳ Please Wait', 'Finish the countdown, then click "Next Slide".', 'warning');
+            return;
+        }
+
+        pendingCaptivateTargetSlide = null;
+        currentSlide = slideNum;
+        updateProgressUI();
+        updateSlideDisplay(slideNum);
+        setNextButtonLabel();
+        saveProgress({ current_slide: currentSlide });
+        startSlideTimer();
     }
 }
 
@@ -1089,10 +1208,8 @@ function onScormSlideChange(slideNum) {
 function onCourseCompleted() {
     console.log('[LMS] Course completion detected');
     contentCompleted = true;
-    highestSlideReached = totalSlides;
-    completionPercentage = 100;
     updateProgressUI();
-    saveProgress();
+    saveProgress({ content_completed: true });
 }
 
 // Called when course finishes
@@ -1150,16 +1267,12 @@ function pollCaptivateSlide() {
             captivateSlide = parseInt(iframeWindow.cp.movie.cpInfoCurrentSlide) + 1;
         }
         
-        // If Captivate reports a different slide than we're tracking, sync up
+        // If Captivate reports a different slide than we're tracking, enforce and sync
         if (captivateSlide > 0 && captivateSlide !== lastPolledSlide) {
             lastPolledSlide = captivateSlide;
+            lastKnownCaptivateSlide = captivateSlide;
             console.log('[LMS] Polled Captivate slide:', captivateSlide, 'Our slide:', currentSlide);
-            
-            // If Captivate is ahead of our tracking, sync up
-            if (captivateSlide > currentSlide) {
-                console.log('[LMS] Captivate advanced - syncing LMS');
-                onScormSlideChange(captivateSlide);
-            }
+            onScormSlideChange(captivateSlide);
         }
     } catch (e) {
         // Cross-origin - can't poll, rely on SCORM
@@ -1198,34 +1311,70 @@ function saveSuspendData(suspendData) {
 }
 
 // Save progress to server
-function saveProgress() {
-    fetch(progressUpdateUrl, {
+function saveProgress(extraPayload = {}) {
+    const payload = Object.assign({
+        current_slide: currentSlide,
+        time_spent: Math.max(1, Math.floor((Date.now() - sessionStartTime) / 60000)),
+        total_slides: totalSlides,
+        content_completed: contentCompleted,
+        scorm_suspend_data: scormData['cmi.suspend_data'] || ''
+    }, extraPayload);
+
+    return fetch(progressUpdateUrl, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'X-CSRFToken': csrfToken
         },
-        body: JSON.stringify({
-            completion_percentage: completionPercentage,
-            current_slide: currentSlide,
-            highest_slide_reached: highestSlideReached,
-            time_spent: Math.max(1, Math.floor((Date.now() - sessionStartTime) / 60000)),
-            total_slides: totalSlides,
-            content_completed: contentCompleted,
-            scorm_suspend_data: scormData['cmi.suspend_data'] || ''
-        })
+        body: JSON.stringify(payload)
     })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            console.log('[LMS] Progress saved:', data);
-            if (data.total_time_spent !== undefined) {
-                document.getElementById('totalTimeSpent').textContent = data.total_time_spent + ' min';
-                document.getElementById('timeSpentDisplay').textContent = data.total_time_spent;
-            }
+    .then(async response => {
+        const data = await response.json().catch(() => ({}));
+        return { ok: response.ok, data };
+    })
+    .then(({ ok, data }) => {
+        if (ok && data && data.success) {
+            syncFromServer(data);
         }
+        return { ok, data };
     })
-    .catch(error => console.error('[LMS] Failed to save progress:', error));
+    .catch(error => {
+        console.error('[LMS] Failed to save progress:', error);
+        return { ok: false, data: { success: false, error: 'Network error while saving progress.' } };
+    });
+}
+
+function syncFromServer(data) {
+    if (!data) return;
+
+    if (data.current_slide !== undefined) currentSlide = data.current_slide;
+    if (data.highest_slide_reached !== undefined) highestSlideReached = data.highest_slide_reached;
+    if (data.completion_percentage !== undefined) completionPercentage = data.completion_percentage;
+    if (data.content_completed !== undefined) contentCompleted = data.content_completed;
+
+    if (data.total_time_spent !== undefined) {
+        document.getElementById('totalTimeSpent').textContent = data.total_time_spent + ' min';
+        document.getElementById('timeSpentDisplay').textContent = data.total_time_spent;
+    }
+
+    updateProgressUI();
+    updateSlideDisplay(currentSlide || highestSlideReached || 0);
+    setNextButtonLabel();
+}
+
+function handleProgressError(data) {
+    const message = (data && data.error) ? data.error : 'Could not save progress.';
+    showToast('⚠️ Progress Not Saved', message, 'warning');
+
+    if (data && data.current_slide) currentSlide = data.current_slide;
+    if (data && data.highest_slide_reached !== undefined) highestSlideReached = data.highest_slide_reached;
+
+    updateProgressUI();
+    updateSlideDisplay(currentSlide || highestSlideReached || 0);
+    setNextButtonLabel();
+
+    if (currentSlide) goToCaptivateSlide(currentSlide);
+    startSlideTimer();
 }
 
 // Update progress UI elements
@@ -1327,6 +1476,15 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     });
+
+    // Mitigate browser back/forward attempts while in the player.
+    try {
+        history.pushState(null, document.title, location.href);
+        window.addEventListener('popstate', function() {
+            history.pushState(null, document.title, location.href);
+            showToast('Navigation Blocked', 'Use the in-course controls to navigate.', 'warning');
+        });
+    } catch (e) {}
 });
 
 // Save progress before leaving
